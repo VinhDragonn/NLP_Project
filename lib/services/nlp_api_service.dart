@@ -44,6 +44,32 @@ class NLPApiService {
     }
   }
   
+  /// Hybrid search using BiLSTM + SBERT backend
+  Future<Map<String, dynamic>> hybridSearch({
+    required String query,
+    int topK = 10,
+  }) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$baseUrl/api/nlp/hybrid-search'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'query': query,
+          'top_k': topK,
+        }),
+      ).timeout(const Duration(seconds: 60));
+      
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      } else {
+        throw Exception('Hybrid Search error: ${response.statusCode}');
+      }
+    } catch (e) {
+      print('❌ Error calling Hybrid search: $e');
+      rethrow;
+    }
+  }
+  
   /// Phân loại ý định người dùng
   /// Sử dụng Naive Bayes và SVM
   Future<Map<String, dynamic>> classifyIntent(String text) async {

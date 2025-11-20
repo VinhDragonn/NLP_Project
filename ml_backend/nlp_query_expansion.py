@@ -245,10 +245,26 @@ class QueryTranslator:
             'tìm', 'tìm kiếm', 'xem', 'cho', 'tôi', 'muốn', 'cần',
             'find', 'search', 'watch', 'want', 'need', 'show me', 'give me'
         }
+        
+        # Common speech-recognition mistakes to fix before translation
+        self.voice_error_map = {
+            'fim': 'phim',
+            'fim.': 'phim',
+            'fim,': 'phim',
+            'phin': 'phim',
+            'film': 'phim',  # sometimes Vietnamese accent recognized as film
+        }
+    
+    def _normalize_voice_errors(self, query: str) -> str:
+        text = query
+        for wrong, correct in self.voice_error_map.items():
+            text = re.sub(rf'\b{re.escape(wrong)}\b', correct, text, flags=re.IGNORECASE)
+        return text
     
     def clean_action_words(self, query: str) -> str:
         """Remove action words at the beginning only"""
-        query_lower = query.lower().strip()
+        normalized_query = self._normalize_voice_errors(query)
+        query_lower = normalized_query.lower().strip()
         words = query_lower.split()
         
         # Remove action words from the beginning
@@ -265,6 +281,7 @@ class QueryTranslator:
     
     def translate_to_english(self, query: str) -> str:
         """Translate query to English if needed, preserving descriptive content"""
+        query = self._normalize_voice_errors(query)
         if not self.translator:
             # If translator not available, just clean action words
             return self.clean_action_words(query)

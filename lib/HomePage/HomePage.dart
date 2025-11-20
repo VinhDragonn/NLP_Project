@@ -115,9 +115,12 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                     context,
                     MaterialPageRoute(
                       builder: (context) => VoiceSearchResultPage(
-                        searchQuery: nlpResult['processed_query'] ?? recognizedText,
+                        searchQuery: recognizedText,
+                        useHybrid: true,
                         aiAnalysis: {
                           'search_query': nlpResult['processed_query'],
+                          'processed_query': nlpResult['processed_query'] ?? recognizedText,
+                          'original_query': recognizedText,
                           'intent': nlpResult['intent'],
                           'confidence': nlpResult['confidence'],
                           'entities': nlpResult['entities'],

@@ -1,18 +1,21 @@
 import 'package:flutter/material.dart';
 import 'package:r08fullmovieapp/DetailScreen/checker.dart';
-import 'package:r08fullmovieapp/RepeatedFunction/repttext.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
+import 'package:r08fullmovieapp/services/nlp_api_service.dart';
+import 'package:translator/translator.dart';
 import 'dart:convert';
 
 class VoiceSearchResultPage extends StatefulWidget {
   final String searchQuery;
   final Map<String, dynamic>? aiAnalysis;
+  final bool useHybrid;
 
   const VoiceSearchResultPage({
     Key? key,
     required this.searchQuery,
     this.aiAnalysis,
+    this.useHybrid = false,
   }) : super(key: key);
 
   @override
@@ -24,6 +27,14 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
   bool isLoading = true;
   bool hasError = false;
   String errorMessage = '';
+  final NLPApiService _nlpApiService = NLPApiService();
+  final GoogleTranslator _translator = GoogleTranslator();
+  String? hybridIntent;
+  double? hybridAlpha;
+  String? translatedQuery;
+  final Map<String, Map<String, dynamic>?> _posterCache = {};
+
+  bool get _useHybrid => widget.useHybrid;
 
   @override
   void initState() {
@@ -35,52 +46,19 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
     setState(() {
       isLoading = true;
       hasError = false;
+      errorMessage = '';
       searchResults.clear();
+      if (_useHybrid) {
+        hybridIntent = null;
+        hybridAlpha = null;
+      }
     });
 
     try {
-      // Xây dựng URL dựa trên intent từ NLP
-      String searchUrl = _buildSearchUrl();
-      
-      print('🔍 Search URL: $searchUrl');
-      
-      var response = await http.get(Uri.parse(searchUrl));
-      
-      print('📡 Response status: ${response.statusCode}');
-      
-      if (response.statusCode == 200) {
-        var data = jsonDecode(response.body);
-        var results = data['results'] as List;
-        
-        print('📊 Results count: ${results.length}');
-        
-        for (var item in results) {
-          if (item['id'] != null &&
-              item['poster_path'] != null &&
-              item['vote_average'] != null) {
-            searchResults.add({
-              'id': item['id'],
-              'poster_path': item['poster_path'],
-              'vote_average': item['vote_average'],
-              'media_type': item['media_type'] ?? 'movie', // Default to movie
-              'popularity': item['popularity'],
-              'overview': item['overview'],
-              'title': item['title'] ?? item['name'] ?? 'Unknown',
-            });
-          }
-        }
-        
-        print('✅ Added ${searchResults.length} results');
-        
-        // Giới hạn kết quả
-        if (searchResults.length > 20) {
-          searchResults = searchResults.take(20).toList();
-        }
+      if (_useHybrid) {
+        await _performHybridSearch();
       } else {
-        setState(() {
-          hasError = true;
-          errorMessage = 'Lỗi kết nối: ${response.statusCode}';
-        });
+        await _performTmdbSearch();
       }
     } catch (e) {
       setState(() {
@@ -94,95 +72,234 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
     }
   }
 
-  // Xây dựng URL tìm kiếm dựa trên intent từ NLP
+  Future<void> _performHybridSearch() async {
+    final rawQuery = _normalizeVoiceText(widget.aiAnalysis?['processed_query'] ??
+        widget.aiAnalysis?['search_query'] ??
+        widget.searchQuery);
+    String queryForBackend = rawQuery;
+
+    try {
+      final translation = await _translator.translate(rawQuery, to: 'en');
+      queryForBackend = translation.text.trim();
+      translatedQuery = queryForBackend;
+      print('🌐 Flutter translation: "$rawQuery" -> "$queryForBackend"');
+    } catch (e) {
+      print('⚠️ Translator error: $e');
+      translatedQuery = null;
+    }
+
+    final response = await _nlpApiService.hybridSearch(
+      query: queryForBackend,
+      topK: 12,
+    );
+
+    final results = (response['results'] as List?) ?? [];
+    final mappedResults = results
+        .map((item) => {
+      'title': (item['movie_title'] ?? '').toString().trim(),
+      'plot': item['plot'] ?? '',
+      'genres': item['genres'] ?? '',
+      'keywords': item['keywords'] ?? '',
+      'score': (item['score'] as num?)?.toDouble() ?? 0.0,
+    })
+        .toList();
+
+    await _attachPostersToHybridResults(mappedResults);
+
+    setState(() {
+      hybridIntent = response['intent']?.toString();
+      hybridAlpha = (response['alpha'] as num?)?.toDouble();
+      searchResults = mappedResults;
+    });
+  }
+
+  Future<void> _attachPostersToHybridResults(
+      List<Map<String, dynamic>> results) async {
+    final futures = results.map((item) async {
+      final title = (item['title'] ?? '').toString();
+      if (title.isEmpty) return;
+      final posterData = await _fetchPosterData(title);
+      if (posterData != null) {
+        item['poster_url'] = posterData['posterUrl'];
+        item['tmdb_id'] = posterData['tmdbId'];
+        item['media_type'] = posterData['mediaType'];
+        item['overview'] = posterData['overview'];
+        item['vote_average'] = posterData['voteAverage'];
+      }
+    });
+    await Future.wait(futures);
+  }
+
+  Future<Map<String, dynamic>?> _fetchPosterData(String title) async {
+    if (title.trim().isEmpty) return null;
+    if (_posterCache.containsKey(title)) {
+      return _posterCache[title];
+    }
+
+    final apiKey = dotenv.env['apikey'];
+    if (apiKey == null || apiKey.isEmpty) {
+      _posterCache[title] = null;
+      return null;
+    }
+
+    try {
+      final url =
+          'https://api.themoviedb.org/3/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(title)}';
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final results = (data['results'] as List?) ?? [];
+        if (results.isEmpty) {
+          _posterCache[title] = null;
+          return null;
+        }
+
+        final match = results.firstWhere(
+              (item) => item['poster_path'] != null,
+          orElse: () => results.first,
+        );
+        final posterPath = match['poster_path'];
+        final posterUrl = posterPath != null
+            ? 'https://image.tmdb.org/t/p/w500$posterPath'
+            : null;
+
+        final mapped = {
+          'posterUrl': posterUrl,
+          'tmdbId': match['id'],
+          'mediaType': (match['media_type'] ?? 'movie').toString(),
+          'overview': match['overview'],
+          'voteAverage': (match['vote_average'] as num?)?.toDouble() ?? 0.0,
+        };
+        _posterCache[title] = mapped;
+        return mapped;
+      }
+    } catch (e) {
+      print('⚠️ Poster fetch error for "$title": $e');
+    }
+
+    _posterCache[title] = null;
+    return null;
+  }
+
+  Future<void> _performTmdbSearch() async {
+    String searchUrl = _buildSearchUrl();
+    print('🔍 Search URL: $searchUrl');
+
+    final response = await http.get(Uri.parse(searchUrl));
+    print('📡 Response status: ${response.statusCode}');
+
+    if (response.statusCode == 200) {
+      var data = jsonDecode(response.body);
+      var results = data['results'] as List;
+
+      print('📊 Results count: ${results.length}');
+
+      List<Map<String, dynamic>> tmdbResults = [];
+      for (var item in results) {
+        if (item['id'] != null &&
+            item['poster_path'] != null &&
+            item['vote_average'] != null) {
+          tmdbResults.add({
+            'id': item['id'],
+            'poster_path': item['poster_path'],
+            'vote_average': item['vote_average'],
+            'media_type': item['media_type'] ?? 'movie',
+            'popularity': item['popularity'],
+            'overview': item['overview'],
+            'title': item['title'] ?? item['name'] ?? 'Unknown',
+          });
+        }
+      }
+
+      if (tmdbResults.length > 20) {
+        tmdbResults = tmdbResults.take(20).toList();
+      }
+
+      setState(() {
+        searchResults = tmdbResults;
+      });
+    } else {
+      throw Exception('Lỗi kết nối: ${response.statusCode}');
+    }
+  }
+
   String _buildSearchUrl() {
     String baseUrl = 'https://api.themoviedb.org/3';
     String apiKey = dotenv.env['apikey'] ?? '';
     String intent = widget.aiAnalysis?['intent'] ?? 'search_by_title';
-    
-    // Ưu tiên entities hơn intent (fix cho trường hợp intent sai)
+
     var entities = widget.aiAnalysis?['entities'];
-    
-    print('🎯 Building URL for intent: $intent');
-    print('🏷️ Entities: $entities');
-    
-    // Nếu có title entity, ưu tiên tìm theo title (chỉ dùng title, bỏ phần "tìm phim")
-    if (entities != null && entities['titles'] != null && (entities['titles'] as List).isNotEmpty) {
+
+    if (entities != null &&
+        entities['titles'] != null &&
+        (entities['titles'] as List).isNotEmpty) {
       String title = (entities['titles'] as List).first;
-      print('✅ Using title search: $title');
       return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(title)}';
     }
-    
-    // Nếu có genre entity, ưu tiên tìm theo genre
-    if (entities != null && entities['genres'] != null && (entities['genres'] as List).isNotEmpty) {
+
+    if (entities != null &&
+        entities['genres'] != null &&
+        (entities['genres'] as List).isNotEmpty) {
       String genreId = _getGenreId((entities['genres'] as List).first);
       if (genreId.isNotEmpty) {
-        print('✅ Using genre search: $genreId');
         return '$baseUrl/discover/movie?api_key=$apiKey&with_genres=$genreId&sort_by=popularity.desc';
       }
     }
-    
-    // Nếu có people entity (diễn viên/đạo diễn), tìm theo tên người
-    if (entities != null && entities['people'] != null && (entities['people'] as List).isNotEmpty) {
+
+    if (entities != null &&
+        entities['people'] != null &&
+        (entities['people'] as List).isNotEmpty) {
       String person = (entities['people'] as List).first;
-      print('✅ Using people search: $person');
-      // Tìm theo tên người (TMDB sẽ tự động tìm phim liên quan)
       return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(person)}';
     }
-    
-    // Nếu có year entity, ưu tiên tìm theo năm
-    if (entities != null && entities['years'] != null && (entities['years'] as List).isNotEmpty) {
+
+    if (entities != null &&
+        entities['years'] != null &&
+        (entities['years'] as List).isNotEmpty) {
       String year = (entities['years'] as List).first;
-      print('✅ Using year search: $year');
       return '$baseUrl/discover/movie?api_key=$apiKey&year=$year&sort_by=popularity.desc';
     }
-    
+
+    final defaultQuery = _getDefaultSearchQuery();
+
     switch (intent) {
       case 'search_by_genre':
-        // Tìm theo thể loại
         var genres = widget.aiAnalysis?['entities']?['genres'] as List?;
         if (genres != null && genres.isNotEmpty) {
           String genreId = _getGenreId(genres.first);
           return '$baseUrl/discover/movie?api_key=$apiKey&with_genres=$genreId&sort_by=popularity.desc';
         }
         break;
-        
+
       case 'search_by_year':
-        // Tìm theo năm
         var years = widget.aiAnalysis?['entities']?['years'] as List?;
         if (years != null && years.isNotEmpty) {
           return '$baseUrl/discover/movie?api_key=$apiKey&year=${years.first}&sort_by=popularity.desc';
         }
         break;
-        
+
       case 'search_popular':
-        // Phim phổ biến
         return '$baseUrl/movie/popular?api_key=$apiKey';
-        
+
       case 'search_high_rating':
-        // Phim đánh giá cao
         return '$baseUrl/discover/movie?api_key=$apiKey&sort_by=vote_average.desc&vote_count.gte=1000';
-        
+
       case 'search_by_actor':
-        // Tìm theo diễn viên (fallback to search)
         var people = widget.aiAnalysis?['entities']?['people'] as List?;
         if (people != null && people.isNotEmpty) {
           return '$baseUrl/search/person?api_key=$apiKey&query=${Uri.encodeComponent(people.first)}';
         }
         break;
-        
+
       case 'search_similar':
       case 'search_by_title':
       default:
-        // Tìm kiếm chung
-        return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(widget.searchQuery)}';
+        return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(defaultQuery)}';
     }
-    
-    // Fallback
-    return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(widget.searchQuery)}';
+
+    return '$baseUrl/search/multi?api_key=$apiKey&query=${Uri.encodeComponent(defaultQuery)}';
   }
-  
-  // Map genre name to TMDB genre ID
+
   String _getGenreId(String genreName) {
     Map<String, String> genreMap = {
       'action': '28',
@@ -236,6 +353,322 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
     return filterTexts.join(', ');
   }
 
+  // 🎯 OPTIMIZED TMDB CARD
+  Widget _buildTmdbResultCard(BuildContext context, Map<String, dynamic> item) {
+    return GestureDetector(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => descriptioncheckui(
+              item['id'],
+              item['media_type'],
+            ),
+          ),
+        );
+      },
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        height: 180,
+        decoration: BoxDecoration(
+          color: const Color.fromRGBO(20, 20, 20, 1),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Poster Image
+            Container(
+              width: MediaQuery.of(context).size.width * 0.35,
+              decoration: BoxDecoration(
+                borderRadius: const BorderRadius.only(
+                  topLeft: Radius.circular(12),
+                  bottomLeft: Radius.circular(12),
+                ),
+                image: DecorationImage(
+                  image: NetworkImage(
+                    'https://image.tmdb.org/t/p/w500${item['poster_path']}',
+                  ),
+                  fit: BoxFit.cover,
+                ),
+              ),
+            ),
+
+            // Content Side
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Header: Title + Type
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            item['title'],
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Container(
+                          margin: const EdgeInsets.only(left: 4),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.amber.withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            item['media_type'].toUpperCase(),
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    // Scrollable Content Area
+                    Expanded(
+                      child: SingleChildScrollView(
+                        physics: const BouncingScrollPhysics(),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            // Stats Row
+                            Padding(
+                              padding: const EdgeInsets.only(top: 6, bottom: 6),
+                              child: Row(
+                                children: [
+                                  _buildInfoChip(
+                                    icon: Icons.star,
+                                    label: '${item['vote_average']}',
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _buildInfoChip(
+                                    icon: Icons.people_outline,
+                                    label:
+                                    '${item['popularity']?.toStringAsFixed(0) ?? 0}',
+                                  ),
+                                ],
+                              ),
+                            ),
+
+                            // Description
+                            Text(
+                              item['overview'] ?? 'Không có mô tả',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.7),
+                                fontSize: 12,
+                                height: 1.3,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // 🎯 OPTIMIZED HYBRID CARD (Cleaned up)
+  Widget _buildHybridResultCard(Map<String, dynamic> item) {
+    final title = (item['title'] ?? '').toString();
+    final score = (item['score'] as num?)?.toDouble() ?? 0.0;
+    final plot = (item['plot'] ?? '').toString();
+    final posterUrl = (item['poster_url'] ?? '').toString();
+    final tmdbId = item['tmdb_id'];
+    final mediaType = (item['media_type'] ?? 'movie').toString();
+    final voteAverage = item['vote_average'];
+
+    return GestureDetector(
+      onTap: tmdbId != null
+          ? () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => descriptioncheckui(
+              tmdbId,
+              mediaType,
+            ),
+          ),
+        );
+      }
+          : null,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        height: 200,
+        decoration: BoxDecoration(
+          color: const Color.fromRGBO(20, 20, 20, 1),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.green.withOpacity(0.2)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Poster Image
+            ClipRRect(
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(12),
+                bottomLeft: Radius.circular(12),
+              ),
+              child: posterUrl.isNotEmpty
+                  ? Image.network(
+                posterUrl,
+                width: 110,
+                height: 200,
+                fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => _buildPosterPlaceholder(),
+              )
+                  : SizedBox(
+                width: 110,
+                child: _buildPosterPlaceholder(),
+              ),
+            ),
+
+            // Content Side
+            Expanded(
+              child: Padding(
+                padding:
+                const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Title + Score Header (Always Visible)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            title.isNotEmpty ? title : 'Chưa rõ tên phim',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Container(
+                          margin: const EdgeInsets.only(left: 4),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: Colors.green.withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.bolt,
+                                  color: Colors.greenAccent, size: 12),
+                              const SizedBox(width: 2),
+                              Text(
+                                score.toStringAsFixed(3),
+                                style: const TextStyle(
+                                  color: Colors.greenAccent,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+
+                    // SCROLLABLE CONTENT (Only Plot + Rating)
+                    Expanded(
+                      child: SingleChildScrollView(
+                        physics: const BouncingScrollPhysics(),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (voteAverage != null)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6, bottom: 4),
+                                child: _buildInfoChip(
+                                  icon: Icons.star,
+                                  label: voteAverage.toString(),
+                                ),
+                              ),
+
+                            // Plot (Clean, scrollable)
+                            if (plot.trim().isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 2),
+                                child: Text(
+                                  plot,
+                                  style: TextStyle(
+                                    color: Colors.white.withOpacity(0.85),
+                                    fontSize: 12,
+                                    height: 1.3,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPosterPlaceholder() {
+    return Container(
+      color: Colors.grey.withOpacity(0.1),
+      child: const Center(
+        child: Icon(Icons.movie_filter, color: Colors.white24, size: 30),
+      ),
+    );
+  }
+
+  Widget _buildInfoChip({required IconData icon, required String label}) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.amber.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.amber, size: 12),
+          const SizedBox(width: 3),
+          Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -248,18 +681,16 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
             Text(
               'Kết quả tìm kiếm',
               style: TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-              ),
+                  color: Colors.white,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600),
             ),
             Text(
               '"${widget.searchQuery}"',
               style: TextStyle(
-                color: Colors.amber,
-                fontSize: 14,
-                fontWeight: FontWeight.w400,
-              ),
+                  color: Colors.amber,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w400),
             ),
           ],
         ),
@@ -276,17 +707,17 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
       ),
       body: Column(
         children: [
-          // Voice search info with AI
+          // Voice search info
           Container(
-            margin: const EdgeInsets.all(16),
-            padding: const EdgeInsets.all(16),
+            margin: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(12),
             decoration: BoxDecoration(
-              color: widget.aiAnalysis != null 
+              color: widget.aiAnalysis != null
                   ? Colors.blue.withOpacity(0.1)
                   : Colors.amber.withOpacity(0.1),
               borderRadius: BorderRadius.circular(12),
               border: Border.all(
-                color: widget.aiAnalysis != null 
+                color: widget.aiAnalysis != null
                     ? Colors.blue.withOpacity(0.3)
                     : Colors.amber.withOpacity(0.3),
               ),
@@ -298,7 +729,9 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
                   children: [
                     Icon(
                       widget.aiAnalysis != null ? Icons.psychology : Icons.mic,
-                      color: widget.aiAnalysis != null ? Colors.blue : Colors.amber,
+                      color: widget.aiAnalysis != null
+                          ? Colors.blue
+                          : Colors.amber,
                       size: 24,
                     ),
                     const SizedBox(width: 12),
@@ -307,344 +740,79 @@ class _VoiceSearchResultPageState extends State<VoiceSearchResultPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            widget.aiAnalysis != null 
+                            widget.aiAnalysis != null
                                 ? 'AI Voice Search'
                                 : 'Tìm kiếm bằng giọng nói',
                             style: TextStyle(
-                              color: widget.aiAnalysis != null ? Colors.blue : Colors.amber,
+                              color: widget.aiAnalysis != null
+                                  ? Colors.blue
+                                  : Colors.amber,
                               fontSize: 16,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
-                          const SizedBox(height: 4),
                           Text(
                             'Đã nhận dạng: "${widget.searchQuery}"',
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.8),
-                              fontSize: 14,
-                            ),
+                                color: Colors.white.withOpacity(0.8),
+                                fontSize: 13),
                           ),
+                          if (_useHybrid &&
+                              translatedQuery != null &&
+                              translatedQuery!.isNotEmpty)
+                            Text(
+                              'EN: "$translatedQuery"',
+                              style: TextStyle(
+                                  color: Colors.greenAccent.withOpacity(0.9),
+                                  fontSize: 11),
+                            ),
                         ],
                       ),
                     ),
                   ],
                 ),
-                if (widget.aiAnalysis != null) ...[
-                  const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.blue.withOpacity(0.05),
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.blue.withOpacity(0.2)),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'AI Phân Tích:',
-                          style: TextStyle(
-                            color: Colors.blue,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        if (widget.aiAnalysis!['search_type'] != null)
-                          Text(
-                            'Loại: ${_getSearchTypeText(widget.aiAnalysis!['search_type'])}',
-                            style: TextStyle(color: Colors.white, fontSize: 11),
-                          ),
-                        if (widget.aiAnalysis!['intent'] != null)
-                          Text(
-                            'Ý định: ${_getIntentText(widget.aiAnalysis!['intent'])}',
-                            style: TextStyle(color: Colors.white, fontSize: 11),
-                          ),
-                        if (widget.aiAnalysis!['filters'] != null && 
-                            widget.aiAnalysis!['filters'].isNotEmpty)
-                          Text(
-                            'Bộ lọc: ${_getFiltersText(widget.aiAnalysis!['filters'])}',
-                            style: TextStyle(color: Colors.white, fontSize: 11),
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
               ],
             ),
           ),
-          
+
           // Search results
           Expanded(
             child: isLoading
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        CircularProgressIndicator(color: Colors.amber),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Đang tìm kiếm...',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
+                ? Center(child: CircularProgressIndicator(color: Colors.amber))
                 : hasError
-                    ? Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              Icons.error_outline,
-                              color: Colors.red,
-                              size: 64,
-                            ),
-                            const SizedBox(height: 16),
-                            Text(
-                              'Có lỗi xảy ra',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Text(
-                              errorMessage,
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(0.7),
-                                fontSize: 14,
-                              ),
-                              textAlign: TextAlign.center,
-                            ),
-                            const SizedBox(height: 16),
-                            ElevatedButton(
-                              onPressed: _performSearch,
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.amber,
-                                foregroundColor: Colors.black,
-                              ),
-                              child: Text('Thử lại'),
-                            ),
-                          ],
-                        ),
-                      )
-                    : searchResults.isEmpty
-                        ? Center(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.search_off,
-                                  color: Colors.white.withOpacity(0.5),
-                                  size: 64,
-                                ),
-                                const SizedBox(height: 16),
-                                Text(
-                                  'Không tìm thấy kết quả',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                                Text(
-                                  'Thử tìm kiếm với từ khóa khác',
-                                  style: TextStyle(
-                                    color: Colors.white.withOpacity(0.7),
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          )
-                        : ListView.builder(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            itemCount: searchResults.length,
-                            itemBuilder: (context, index) {
-                              final item = searchResults[index];
-                              return GestureDetector(
-                                onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (context) => descriptioncheckui(
-                                        item['id'],
-                                        item['media_type'],
-                                      ),
-                                    ),
-                                  );
-                                },
-                                child: Container(
-                                  margin: const EdgeInsets.only(bottom: 12),
-                                  height: 180,
-                                  decoration: BoxDecoration(
-                                    color: const Color.fromRGBO(20, 20, 20, 1),
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  child: Row(
-                                    children: [
-                                      // Poster
-                                      Container(
-                                        width: MediaQuery.of(context).size.width * 0.4,
-                                        decoration: BoxDecoration(
-                                          borderRadius: const BorderRadius.only(
-                                            topLeft: Radius.circular(12),
-                                            bottomLeft: Radius.circular(12),
-                                          ),
-                                          image: DecorationImage(
-                                            image: NetworkImage(
-                                              'https://image.tmdb.org/t/p/w500${item['poster_path']}',
-                                            ),
-                                            fit: BoxFit.cover,
-                                          ),
-                                        ),
-                                      ),
-                                      
-                                      const SizedBox(width: 16),
-                                      
-                                      // Content
-                                      Expanded(
-                                        child: Padding(
-                                          padding: const EdgeInsets.all(12),
-                                          child: Column(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              // Title and media type
-                                              Row(
-                                                children: [
-                                                  Expanded(
-                                                    child: Text(
-                                                      item['title'],
-                                                      style: const TextStyle(
-                                                        color: Colors.white,
-                                                        fontSize: 16,
-                                                        fontWeight: FontWeight.w600,
-                                                      ),
-                                                      maxLines: 2,
-                                                      overflow: TextOverflow.ellipsis,
-                                                    ),
-                                                  ),
-                                                  Container(
-                                                    padding: const EdgeInsets.symmetric(
-                                                      horizontal: 8,
-                                                      vertical: 4,
-                                                    ),
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.amber.withOpacity(0.2),
-                                                      borderRadius: BorderRadius.circular(8),
-                                                    ),
-                                                    child: Text(
-                                                      item['media_type'].toUpperCase(),
-                                                      style: const TextStyle(
-                                                        color: Colors.amber,
-                                                        fontSize: 10,
-                                                        fontWeight: FontWeight.w600,
-                                                      ),
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                              
-                                              const SizedBox(height: 12),
-                                              
-                                              // Rating and popularity
-                                              Wrap(
-                                                spacing: 8,
-                                                runSpacing: 4,
-                                                children: [
-                                                  Container(
-                                                    padding: const EdgeInsets.symmetric(
-                                                      horizontal: 6,
-                                                      vertical: 3,
-                                                    ),
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.amber.withOpacity(0.2),
-                                                      borderRadius: BorderRadius.circular(6),
-                                                    ),
-                                                    child: Row(
-                                                      mainAxisSize: MainAxisSize.min,
-                                                      children: [
-                                                        const Icon(
-                                                          Icons.star,
-                                                          color: Colors.amber,
-                                                          size: 14,
-                                                        ),
-                                                        const SizedBox(width: 3),
-                                                        Text(
-                                                          '${item['vote_average']}',
-                                                          style: const TextStyle(
-                                                            color: Colors.white,
-                                                            fontSize: 11,
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                  
-                                                  Container(
-                                                    padding: const EdgeInsets.symmetric(
-                                                      horizontal: 6,
-                                                      vertical: 3,
-                                                    ),
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.amber.withOpacity(0.2),
-                                                      borderRadius: BorderRadius.circular(6),
-                                                    ),
-                                                    child: Row(
-                                                      mainAxisSize: MainAxisSize.min,
-                                                      children: [
-                                                        const Icon(
-                                                          Icons.people_outline,
-                                                          color: Colors.amber,
-                                                          size: 14,
-                                                        ),
-                                                        const SizedBox(width: 3),
-                                                        Text(
-                                                          '${item['popularity']?.toStringAsFixed(0) ?? 0}',
-                                                          style: const TextStyle(
-                                                            color: Colors.white,
-                                                            fontSize: 11,
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  ),
-                                                ],
-                                              ),
-                                              
-                                              const SizedBox(height: 12),
-                                              
-                                              // Overview
-                                              Expanded(
-                                                child: Text(
-                                                  item['overview'] ?? 'Không có mô tả',
-                                                  style: TextStyle(
-                                                    color: Colors.white.withOpacity(0.7),
-                                                    fontSize: 12,
-                                                  ),
-                                                  maxLines: 3,
-                                                  overflow: TextOverflow.ellipsis,
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
+                ? Center(
+                child: Text(errorMessage,
+                    style: TextStyle(color: Colors.white)))
+                : searchResults.isEmpty
+                ? Center(
+                child: Text('Không tìm thấy kết quả',
+                    style: TextStyle(color: Colors.white)))
+                : ListView.builder(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              itemCount: searchResults.length,
+              itemBuilder: (context, index) {
+                final item = searchResults[index];
+                return _useHybrid
+                    ? _buildHybridResultCard(item)
+                    : _buildTmdbResultCard(context, item);
+              },
+            ),
           ),
         ],
       ),
     );
   }
-} 
+
+  String _normalizeVoiceText(String text) {
+    return text
+        .replaceAll(RegExp(r'\bfim\b', caseSensitive: false), 'phim')
+        .replaceAll(RegExp(r'\bfin\b', caseSensitive: false), 'phim');
+  }
+
+  String _getDefaultSearchQuery() {
+    final raw = widget.aiAnalysis?['processed_query'] ??
+        widget.aiAnalysis?['search_query'] ??
+        widget.searchQuery;
+    return _normalizeVoiceText(raw);
+  }
+}

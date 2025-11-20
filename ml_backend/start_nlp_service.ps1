@@ -62,8 +62,22 @@ Write-Host "  Change: baseUrl = 'http://$mainIP:8002'" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 
-# Set port environment variable
+# Resolve script directory for relative paths
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$dataDir = Join-Path $scriptDir "data"
+$datasetPath = Join-Path $dataDir "rotten_tomatoes_ENRICHED.csv"
+
+if (-not (Test-Path $datasetPath)) {
+    Write-Host "[WARN] Dataset not found at $datasetPath" -ForegroundColor Yellow
+    Write-Host "       Please place 'rotten_tomatoes_ENRICHED.csv' inside the /data folder." -ForegroundColor Yellow
+} else {
+    Write-Host "[OK] Dataset found: $datasetPath" -ForegroundColor Green
+}
+
+# Set environment variables for backend
 $env:NLP_PORT = "8002"
+$env:HYBRID_DATA_DIR = $dataDir
+$env:MOVIE_DATASET_PATH = $datasetPath
 
 Write-Host "[4/4] Starting NLP Service on port 8002..." -ForegroundColor Yellow
 Write-Host ""

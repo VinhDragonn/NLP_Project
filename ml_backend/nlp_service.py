@@ -4,6 +4,7 @@ FastAPI service for natural language processing of movie search queries
 """
 
 import os
+from pathlib import Path
 from typing import List, Dict, Optional, Any
 from contextlib import asynccontextmanager
 
@@ -20,6 +21,10 @@ from nlp_ner import QueryAnalyzer, SemanticMatcher
 from nlp_semantic_similarity import SemanticSimilarityCalculator, FuzzyMatcher
 from nlp_query_expansion import NLPQueryProcessor
 from hybrid_search_engine import HybridSearchEngine
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DATA_DIR = BASE_DIR / "data"
+DEFAULT_DATASET_PATH = DEFAULT_DATA_DIR / "rotten_tomatoes_ENRICHED.csv"
 
 
 # ===== Pydantic Models =====
@@ -152,10 +157,11 @@ async def lifespan(app: FastAPI):
     print("Initializing Hybrid Search Engine (BiLSTM + Hybrid)...")
     print("=" * 60)
     try:
-        HYBRID_SEARCH_ENGINE = HybridSearchEngine(data_dir="data")
+        data_dir = os.getenv("HYBRID_DATA_DIR", str(DEFAULT_DATA_DIR))
+        dataset_path = os.getenv("MOVIE_DATASET_PATH", str(DEFAULT_DATASET_PATH))
+        HYBRID_SEARCH_ENGINE = HybridSearchEngine(data_dir=data_dir)
         
-        # Try to load dataset (if available)
-        dataset_path = os.getenv("MOVIE_DATASET_PATH", "data/rotten_tomatoes_ENRICHED.csv")
+        # Ensure dataset exists
         if os.path.exists(dataset_path):
             print(f"📂 Loading dataset from: {dataset_path}")
             HYBRID_SEARCH_ENGINE.load_dataset(dataset_path)
@@ -163,15 +169,15 @@ async def lifespan(app: FastAPI):
             HYBRID_SEARCH_ENGINE.initialize_sbert()
             
             # Try to load or train intent classifier
-            intent_model_path = "data/intent_classifier.h5"
+            intent_model_path = os.path.join(data_dir, "intent_classifier.h5")
             if os.path.exists(intent_model_path):
                 try:
                     HYBRID_SEARCH_ENGINE.load_intent_classifier(intent_model_path)
                     print("✅ Intent classifier loaded")
-                except:
-                    print("⚠️ Could not load intent classifier, will train if needed")
+                except Exception as intent_err:
+                    print(f"⚠️ Could not load intent classifier ({intent_err}). Will fall back to rule-based intent.")
             else:
-                print("⚠️ Intent classifier not found. Train it using train_intent_classifier()")
+                print("⚠️ Intent classifier not found. Train it using train_intent_classifier() when TensorFlow is available.")
             
             print("✅ Hybrid Search Engine ready!")
         else:
