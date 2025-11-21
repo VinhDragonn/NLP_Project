@@ -1,0 +1,2 @@
+web: python nlp_service_api.py
+

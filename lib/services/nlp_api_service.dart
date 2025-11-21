@@ -1,13 +1,14 @@
 import 'dart:convert';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:http/http.dart' as http;
 
 /// Service để gọi NLP API (Python backend)
 /// Thay thế việc sử dụng thư viện speech_to_text
 class NLPApiService {
-  // URL của NLP Service (đang chạy trên port 8002)
-  // IP máy tính: 192.168.100.219 (cập nhật theo ipconfig)
-  // Nếu không kết nối được, chạy: ipconfig | findstr /i "IPv4" để tìm IP mới
-  final String baseUrl = 'http://192.168.100.219:8002';
+  // Ưu tiên lấy base URL từ .env để dễ thay đổi (ví dụ khi deploy)
+  // Nếu không có, dùng Railway service đã triển khai (port 8002).
+  final String baseUrl = dotenv.env['NLP_BASE_URL'] ??
+      'https://nlpproject-production.up.railway.app';
   
   /// Xử lý voice search với tất cả thuật toán NLP
   /// 
