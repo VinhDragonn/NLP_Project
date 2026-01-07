@@ -1,281 +1,192 @@
+# ==========================================
+# API DỰ ĐOÁN PHIM (BẢN SẠCH LOG - FINAL)
+# ==========================================
 import os
+import warnings
+
+# --- CẤU HÌNH TẮT CẢNH BÁO (QUAN TRỌNG) ---
+# Đặt cái này lên đầu tiên để chặn mọi cảnh báo rác
+os.environ["PYTHONWARNINGS"] = "ignore"
+warnings.filterwarnings("ignore")
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
+# ------------------------------------------
+
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
 import pandas as pd
 import numpy as np
+import gdown
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Thư viện Machine Learning
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-    VotingClassifier
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
 from imblearn.under_sampling import RandomUnderSampler
 
-# ===== Config =====
-CSV_PATH = os.getenv(
-    "RT_CSV_PATH",
-    "C:/Users/vinh0/Documents/aaaaaaaaaaaaaaaaaaaaaaaaaaa/rotten_tomatoes_movies.csv",
-)
+# ===== CẤU HÌNH =====
+# Tên file giữ nguyên để NLP Service không bị lỗi
+CSV_FILENAME = "rotten_tomatoes_ENRICHED.csv"
+# ID file chứa dữ liệu TMDB (Budget, Revenue, Popularity)
+DRIVE_FILE_ID = "1gRNeO8VcJKqudnynfgnMb-v7fRqMOcpS"
 RANDOM_STATE = 42
 
+# ===== 1. HELPER CLASSES =====
+
+class TargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, col_name, target_name='success', smooth=10):
+        self.col_name = col_name
+        self.target_name = target_name
+        self.smooth = smooth
+        self.map_dict = {}
+        self.global_mean = 0
+
+    def fit(self, X, y):
+        temp_df = X.copy()
+        temp_df[self.target_name] = y
+        stats = temp_df.groupby(self.col_name)[self.target_name].agg(['mean', 'count'])
+        self.global_mean = y.mean()
+        smoothed = (stats['mean'] * stats['count'] + self.global_mean * self.smooth) / (stats['count'] + self.smooth)
+        self.map_dict = smoothed.to_dict()
+        return self
+
+    def transform(self, X):
+        return X[self.col_name].map(self.map_dict).fillna(self.global_mean).values.reshape(-1, 1)
+
+def ensure_data_is_latest():
+    """
+    Kiểm tra file hiện tại. Nếu là file cũ (thiếu budget) -> Xóa đi tải lại file xịn.
+    """
+    should_download = False
+
+    if not os.path.exists(CSV_FILENAME):
+        should_download = True
+        print("📉 Chưa thấy file dữ liệu. Đang tải mới...")
+    else:
+        try:
+            # Đọc thử 5 dòng xem có cột budget chưa
+            df_check = pd.read_csv(CSV_FILENAME, nrows=5)
+            if 'budget' not in df_check.columns:
+                print("⚠️ Phát hiện file cũ (thiếu Budget). Đang cập nhật bản mới...")
+                os.remove(CSV_FILENAME)
+                should_download = True
+            else:
+                print("✅ File dữ liệu đã là phiên bản mới nhất.")
+        except:
+            should_download = True
+
+    if should_download:
+        url = f'https://drive.google.com/uc?id={DRIVE_FILE_ID}'
+        gdown.download(url, CSV_FILENAME, quiet=False)
+        print("✅ Tải xong dữ liệu Super Enriched!")
+
 def engineer_features(df):
-    """Advanced feature engineering - NO LEAKAGE"""
+    """Xử lý đặc trưng (Feature Engineering)"""
+    # 1. Xử lý chuỗi
+    df['primary_director'] = df['directors'].astype(str).str.split(',').str[0].str.strip()
+    df['clean_company'] = df['production_company'].astype(str).str.strip()
+    df['primary_genre'] = df['genres'].astype(str).str.split('|').str[0]
 
-    # 1. Director reputation (chỉ dùng số lượng, KHÔNG dùng success rate)
-    director_counts = df['directors'].value_counts()
-    df['director_experience'] = df['directors'].map(director_counts).fillna(1)
-    df['director_is_prolific'] = (df['director_experience'] >= 5).astype(int)
-    df['director_is_veteran'] = (df['director_experience'] >= 10).astype(int)
+    valid_ratings = ['PG', 'R', 'PG-13', 'G']
+    df['content_rating'] = df['content_rating'].apply(lambda x: x if x in valid_ratings else 'Unrated')
 
-    # 2. Genre analysis (KHÔNG dùng success rate từ data)
-    # Extract primary genre
-    df['primary_genre'] = df['genres'].fillna('Unknown').str.split('|').str[0]
+    # 2. Xử lý số
+    df['runtime'] = df['runtime'].fillna(df['runtime'].median())
+    df['release_year'] = pd.to_datetime(df['original_release_date'], errors='coerce').dt.year.fillna(2024)
 
-    # Count genres (multi-genre films)
-    df['genre_count'] = df['genres'].fillna('').str.count(r'\|') + 1
-    df['is_multi_genre'] = (df['genre_count'] >= 3).astype(int)
+    # 3. LOGIC TÀI CHÍNH (QUAN TRỌNG)
+    if 'budget' not in df.columns: df['budget'] = 0
+    if 'tmdb_popularity' not in df.columns: df['tmdb_popularity'] = 0
 
-    # Popular genres (based on domain knowledge, not data)
-    popular_genres = ['Action', 'Comedy', 'Drama', 'Thriller', 'Adventure', 'Science Fiction']
-    df['is_popular_genre'] = df['primary_genre'].isin(popular_genres).astype(int)
+    # Cột đánh dấu: Phim này có dữ liệu tiền thật hay không?
+    df['has_financial_data'] = (df['budget'] > 1000).astype(int)
 
-    # 3. Production company (chỉ dùng số lượng, KHÔNG dùng success rate)
-    company_counts = df['production_company'].value_counts()
-    df['company_experience'] = df['production_company'].map(company_counts).fillna(1)
-    df['is_major_studio'] = (df['company_experience'] >= 20).astype(int)
+    # Log Transform
+    df['budget_log'] = np.log1p(df['budget'].fillna(0))
+    df['popularity_log'] = np.log1p(df['tmdb_popularity'].fillna(0))
 
-    # Major studios (domain knowledge)
-    major_studios = ['Warner Bros.', 'Universal Pictures', 'Paramount Pictures',
-                     'Walt Disney Pictures', '20th Century Fox', 'Columbia Pictures',
-                     'Marvel Studios', 'Pixar', 'DreamWorks']
-    df['is_known_studio'] = df['production_company'].isin(major_studios).astype(int)
+    # 4. Văn bản & Sequel
+    if 'keywords' not in df.columns: df['keywords'] = ''
+    if 'movie_info' not in df.columns: df['movie_info'] = ''
+    df['text_content'] = df['keywords'].fillna('') + " " + df['movie_info'].fillna('')
 
-    # 4. Runtime features
-    df['runtime_filled'] = df['runtime'].fillna(df['runtime'].median())
-    df['runtime_category'] = pd.cut(
-        df['runtime_filled'],
-        bins=[0, 85, 105, 130, 300],
-        labels=['very_short', 'short', 'medium', 'long']
-    )
-    df['is_optimal_runtime'] = ((df['runtime_filled'] >= 95) & (df['runtime_filled'] <= 125)).astype(int)
-
-    # 5. Release timing
-    df['release_date'] = pd.to_datetime(df['original_release_date'], errors='coerce')
-    df['release_month'] = df['release_date'].dt.month.fillna(6)
-    df['release_quarter'] = df['release_date'].dt.quarter.fillna(2)
-
-    # Summer blockbuster season (May-Aug) and Holiday season (Nov-Dec)
-    df['is_blockbuster_season'] = df['release_month'].isin([5,6,7,8]).astype(int)
-    df['is_holiday_season'] = df['release_month'].isin([11,12]).astype(int)
-    df['is_awards_season'] = df['release_month'].isin([10,11,12,1]).astype(int)
-
-    # 6. Year trends (REMOVE bias về phim mới)
-    df['release_year_filled'] = df['release_year'].fillna(df['release_year'].median())
-    # BỎ years_since_2000 và is_recent vì gây bias
-    # df['years_since_2000'] = df['release_year_filled'] - 2000
-    # df['is_recent'] = (df['release_year_filled'] >= 2015).astype(int)
-
-    # 7. Title analysis
-    df['title_length'] = df['movie_title'].fillna('').str.len()
-    df['is_sequel'] = df['movie_title'].fillna('').str.contains(
-        r'\d|II|III|IV|Part|Chapter|Episode',
-        case=False,
-        regex=True
-    ).astype(int)
-    df['has_colon'] = df['movie_title'].fillna('').str.contains(':').astype(int)
-
-    # 8. Interaction features
-    df['director_genre_combo'] = df['directors'].astype(str) + '_' + df['primary_genre'].astype(str)
-    df['company_genre_combo'] = df['production_company'].astype(str) + '_' + df['primary_genre'].astype(str)
+    df['is_sequel'] = df['movie_title'].astype(str).str.contains(
+        r'\s\d+$|II|III|IV|Part\s\d|:.*|Returns|Saga', case=False, regex=True).astype(int)
 
     return df
 
+# ===== 2. CORE TRAINING =====
+
 def load_and_train():
-    print("Loading data...")
-    df = pd.read_csv(CSV_PATH)
+    ensure_data_is_latest()
 
-    if "tomatometer_rating" not in df.columns:
-        raise RuntimeError("CSV missing column 'tomatometer_rating'.")
+    print("🚀 Loading data & Training (FULL STRATEGY)...")
+    df = pd.read_csv(CSV_FILENAME)
 
-    # Label (70% threshold)
+    # Giữ lại toàn bộ phim, kể cả phim thiếu budget
     df = df.dropna(subset=["tomatometer_rating"])
-    df["success"] = (df["tomatometer_rating"] >= 70).astype(int)
+    print(f"DEBUG: Đang học trên tổng số {len(df)} bộ phim.")
 
-    print(f"Dataset size: {len(df)}")
-    print(f"Success rate: {df['success'].mean():.2%}")
+    df["success"] = (df["tomatometer_rating"] >= 60).astype(int)
 
-    # Extract year
-    df["release_year"] = pd.to_datetime(
-        df["original_release_date"], errors="coerce"
-    ).dt.year
-
-    # Feature engineering
-    print("Engineering features...")
     df = engineer_features(df)
 
-    # Select features
-    categorical_features = [
-        "directors", "primary_genre", "production_company",
-        "runtime_category", "director_genre_combo"
-    ]
-
-    numerical_features = [
-        "runtime_filled", "release_year_filled",
-        "director_experience", "director_is_prolific", "director_is_veteran",
-        "genre_count", "is_multi_genre", "is_popular_genre",
-        "company_experience", "is_major_studio", "is_known_studio",
-        "is_optimal_runtime", "is_blockbuster_season", "is_holiday_season",
-        "is_awards_season", "is_sequel", "has_colon",
-        "title_length", "release_quarter"
-    ]
-
-    features = categorical_features + numerical_features
-
-    # Fillna
-    fill_values = {
-        "directors": "Unknown",
-        "primary_genre": "Unknown",
-        "production_company": "Unknown",
-        "runtime_category": "medium",
-        "director_genre_combo": "Unknown_Unknown",
-        **{feat: 0 for feat in numerical_features}
-    }
-
-    X = df[features].fillna(fill_values)
-    y = df["success"]
-
-    # Preprocessing
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", StandardScaler(), numerical_features),
-            (
-                "cat",
-                OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=100),
-                categorical_features,
-            ),
-        ]
-    )
-
-    # ===== ENSEMBLE MODEL =====
-    print("Building ensemble model...")
-
-    # Model 1: Gradient Boosting (best for structured data)
-    gb = GradientBoostingClassifier(
-        n_estimators=400,
-        learning_rate=0.05,
-        max_depth=6,
-        min_samples_split=20,
-        min_samples_leaf=10,
-        subsample=0.8,
-        random_state=RANDOM_STATE,
-    )
-
-    # Model 2: Random Forest (good for feature interactions)
-    rf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=12,
-        min_samples_split=15,
-        min_samples_leaf=5,
-        max_features='sqrt',
-        random_state=RANDOM_STATE,
-        class_weight='balanced',
-    )
-
-    # Model 3: Logistic Regression (linear baseline)
-    lr = LogisticRegression(
-        C=0.5,
-        max_iter=1000,
-        random_state=RANDOM_STATE,
-        class_weight='balanced'
-    )
-
-    # Voting ensemble (soft voting for probability averaging)
-    ensemble = VotingClassifier(
-        estimators=[
-            ('gb', gb),
-            ('rf', rf),
-            ('lr', lr)
-        ],
-        voting='soft',
-        weights=[2, 1.5, 1]  # GB gets more weight
-    )
-
-    model = Pipeline(
-        steps=[
-            ("preprocess", preprocessor),
-            ("clf", ensemble)
-        ]
-    )
-
-    # Balance data
-    print("Balancing dataset...")
+    # Cân bằng dữ liệu
     rus = RandomUnderSampler(random_state=RANDOM_STATE)
-    X_bal, y_bal = rus.fit_resample(X, y)
+    X_bal, y_bal = rus.fit_resample(df, df["success"])
 
-    # Train/test split
     X_train, X_test, y_train, y_test = train_test_split(
         X_bal, y_bal, test_size=0.2, random_state=RANDOM_STATE, stratify=y_bal
     )
 
-    # Train
-    print("Training ensemble model...")
+    # --- PIPELINE ---
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', StandardScaler(), ['runtime', 'release_year', 'is_sequel', 'budget_log', 'popularity_log', 'has_financial_data']),
+            ('dir_score', Pipeline([('enc', TargetEncoder(col_name='primary_director', smooth=5))]), ['primary_director']),
+            ('com_score', Pipeline([('enc', TargetEncoder(col_name='clean_company', smooth=10))]), ['clean_company']),
+            ('txt', Pipeline([('tfidf', TfidfVectorizer(max_features=150, stop_words='english'))]), 'text_content'),
+            ('cat', Pipeline([('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))]), ['content_rating', 'primary_genre'])
+        ]
+    )
+
+    # Tăng sức mạnh Random Forest lên vì dữ liệu giờ to hơn
+    rf = RandomForestClassifier(n_estimators=400, max_depth=20, n_jobs=-1, random_state=RANDOM_STATE)
+    knn = KNeighborsClassifier(n_neighbors=20, n_jobs=-1)
+
+    ensemble = VotingClassifier(
+        estimators=[('RF', rf), ('KNN', knn)],
+        voting='soft'
+    )
+
+    model = Pipeline(steps=[("preprocess", preprocessor), ("clf", ensemble)])
+
+    print("⏳ Training model...")
     model.fit(X_train, y_train)
 
-    # Evaluation
-    try:
-        from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+    acc = model.score(X_test, y_test)
+    print(f"✅ ACCURACY: {acc:.2%}")
 
-        y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)[:, 1]
+    return model
 
-        print("\n" + "="*60)
-        print("BEST MODEL (ENSEMBLE) - Classification Report:")
-        print("="*60)
-        print(classification_report(y_test, y_pred, digits=3))
-        print("\nConfusion Matrix:")
-        cm = confusion_matrix(y_test, y_pred)
-        print(cm)
-        print(f"\nROC-AUC Score: {roc_auc_score(y_test, y_proba):.3f}")
-        print("="*60 + "\n")
-
-        # Distribution
-        print(f"Training set - Success: {sum(y_train)} ({sum(y_train)/len(y_train):.1%}), Fail: {len(y_train) - sum(y_train)} ({(len(y_train) - sum(y_train))/len(y_train):.1%})")
-        print(f"Test predictions - Success: {sum(y_pred)} ({sum(y_pred)/len(y_pred):.1%}), Fail: {len(y_pred) - sum(y_pred)} ({(len(y_pred) - sum(y_pred))/len(y_pred):.1%})")
-
-        # Feature importance (from GB)
-        print("\nTop 10 Most Important Features:")
-        feature_names = (
-            numerical_features +
-            list(preprocessor.named_transformers_['cat'].get_feature_names_out(categorical_features))
-        )
-        importances = model.named_steps['clf'].estimators_[0].feature_importances_
-        top_indices = np.argsort(importances)[-10:][::-1]
-        for idx in top_indices:
-            if idx < len(feature_names):
-                print(f"  {feature_names[idx]}: {importances[idx]:.4f}")
-
-    except Exception as e:
-        print(f"Could not compute detailed metrics: {e}")
-
-    return model, features, fill_values
-
+# ===== 3. API SETUP =====
 
 class MovieFeatures(BaseModel):
-    movie_title: Optional[str] = Field(None, description="Movie title")
+    movie_title: Optional[str] = Field(None)
     directors: str
     genres: str
     production_company: str
     runtime: float
     release_year: float
-
 
 class PredictResponse(BaseModel):
     prediction: int
@@ -283,24 +194,18 @@ class PredictResponse(BaseModel):
     confidence: float
     success_probability: float
 
-
 MODEL = None
-FEATURES: List[str] = []
-FILL_VALUES = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global MODEL, FEATURES, FILL_VALUES
+    global MODEL
     print(f"\n{'='*60}")
-    print("BEST MODEL - Loading and Training")
+    print("STARTING SERVER")
     print(f"{'='*60}\n")
-    MODEL, FEATURES, FILL_VALUES = load_and_train()
-    print("\n✅ BEST Model ready for predictions!\n")
+    MODEL = load_and_train()
     yield
 
-
-app = FastAPI(title="Movie Success Predictor (BEST)", lifespan=lifespan)
+app = FastAPI(title="Movie Predictor", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -309,49 +214,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "model": "best_ensemble"}
-
-
 @app.post("/predict", response_model=PredictResponse)
 def predict(payload: MovieFeatures):
     if MODEL is None:
         raise HTTPException(status_code=503, detail="Model not ready")
 
-    # Feature engineering for new input
-    primary_genre = payload.genres.split('|')[0] if '|' in payload.genres else payload.genres
-    runtime_filled = payload.runtime if payload.runtime > 0 else 105
+    # --- LOGIC AUTO-FILL (Ước lượng kinh phí) ---
+    est_budget = 20_000_000
+    est_pop = 40
+
+    # Hãng lớn
+    giants = ['Disney', 'Marvel', 'Warner', 'Universal', 'Paramount', 'Fox', 'Sony', 'Netflix', 'Amazon']
+    if any(g.lower() in payload.production_company.lower() for g in giants):
+        est_budget = 150_000_000
+        est_pop = 200
+
+    # Thể loại đắt tiền
+    if 'Action' in payload.genres or 'Adventure' in payload.genres or 'Sci-Fi' in payload.genres:
+        est_budget = max(est_budget, 100_000_000)
+
+    # Hoạt hình lớn
+    if 'Animation' in payload.genres and ('Disney' in payload.production_company or 'Pixar' in payload.production_company):
+        est_budget = 200_000_000
+
+    # Phim Indie
+    if 'Indie' in payload.production_company or 'Art House' in payload.genres:
+        est_budget = 5_000_000
 
     data = {
-        'directors': payload.directors,
-        'primary_genre': primary_genre,
-        'production_company': payload.production_company,
-        'runtime_category': 'very_short' if runtime_filled < 85 else 'short' if runtime_filled < 105 else 'medium' if runtime_filled < 130 else 'long',
-        'director_genre_combo': f"{payload.directors}_{primary_genre}",
-        'runtime_filled': runtime_filled,
-        'release_year_filled': payload.release_year,
-        'director_experience': 5,
-        'director_is_prolific': 1,
-        'director_is_veteran': 0,
-        'genre_count': payload.genres.count('|') + 1,
-        'is_multi_genre': 1 if payload.genres.count('|') >= 2 else 0,
-        'is_popular_genre': 1 if primary_genre in ['Action', 'Comedy', 'Drama', 'Thriller', 'Adventure', 'Science Fiction'] else 0,
-        'company_experience': 10,
-        'is_major_studio': 0,
-        'is_known_studio': 1 if payload.production_company in ['Warner Bros.', 'Universal Pictures', 'Marvel Studios', 'Pixar', 'DC Studios'] else 0,
-        'is_optimal_runtime': 1 if 95 <= runtime_filled <= 125 else 0,
-        'is_blockbuster_season': 0,
-        'is_holiday_season': 0,
-        'is_awards_season': 0,
-        'is_sequel': 1 if payload.movie_title and any(c.isdigit() for c in payload.movie_title) else 0,
-        'has_colon': 1 if payload.movie_title and ':' in payload.movie_title else 0,
-        'title_length': len(payload.movie_title) if payload.movie_title else 20,
-        'release_quarter': 2,
+        'movie_title': [payload.movie_title if payload.movie_title else ""],
+        'directors': [payload.directors],
+        'genres': [payload.genres],
+        'production_company': [payload.production_company],
+        'runtime': [payload.runtime],
+        'original_release_date': [f"{int(payload.release_year)}-01-01"],
+        'content_rating': ["PG-13"],
+        'keywords': [""],
+        'movie_info': [payload.movie_title],
+        'budget': [est_budget],
+        'tmdb_popularity': [est_pop]
     }
 
-    df_in = pd.DataFrame([data])
+    df_in = pd.DataFrame(data)
+    df_in = engineer_features(df_in)
 
     try:
         pred = int(MODEL.predict(df_in)[0])
@@ -367,7 +272,6 @@ def predict(payload: MovieFeatures):
         confidence=confidence,
         success_probability=success_prob
     )
-
 
 if __name__ == "__main__":
     import uvicorn

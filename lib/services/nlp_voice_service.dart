@@ -5,7 +5,7 @@ import 'package:fluttertoast/fluttertoast.dart';
 import 'nlp_api_service.dart';
 
 /// Voice Service tích hợp với NLP algorithms (tự code)
-/// Thay thế GoogleVoiceService cũ
+/// Đã tối ưu tốc độ phản hồi (Low Latency)
 class NLPVoiceService {
   static final SpeechToText _speechToText = SpeechToText();
   static final NLPApiService _nlpService = NLPApiService();
@@ -67,7 +67,7 @@ class NLPVoiceService {
     // Kiểm tra NLP service có hoạt động không
     bool nlpAvailable = await _nlpService.checkHealth();
     if (!nlpAvailable) {
-      _showToast("⚠️ NLP Service không khả dụng. Vui lòng khởi động backend.");
+      _showToast("⚠️ NLP Service không khả dụng. Vui lòng kiểm tra Server.");
       return;
     }
 
@@ -81,7 +81,9 @@ class NLPVoiceService {
             String recognizedText = result.recognizedWords;
             print('🎤 Recognized: $recognizedText');
 
-            _isListening = false;
+            // Ngắt listening ngay lập tức để UI phản hồi nhanh hơn
+            await stopListening();
+
             _isProcessing = true;
             onStatusChange('processing');
 
@@ -109,8 +111,8 @@ class NLPVoiceService {
               _isProcessing = false;
               onStatusChange('error');
               _showToast("Lỗi xử lý NLP: $e");
-              
-              // Fallback: trả về kết quả đơn giản
+
+              // Fallback: trả về kết quả đơn giản nếu NLP lỗi
               onResult(recognizedText, {
                 'original_text': recognizedText,
                 'processed_query': recognizedText,
@@ -123,7 +125,12 @@ class NLPVoiceService {
           }
         },
         localeId: language,
-        listenMode: ListenMode.confirmation,
+
+        // --- CẤU HÌNH TỐI ƯU TỐC ĐỘ ---
+        listenMode: ListenMode.search, // Chế độ tìm kiếm (nhanh hơn confirmation)
+        pauseFor: const Duration(milliseconds: 800), // Chỉ chờ 0.8s im lặng là gửi luôn (QUAN TRỌNG)
+        // -----------------------------
+
         cancelOnError: true,
         partialResults: false,
       );
@@ -138,22 +145,21 @@ class NLPVoiceService {
 
   /// Dừng lắng nghe
   static Future<void> stopListening() async {
-    if (_isListening) {
-      await _speechToText.stop();
-      _isListening = false;
-    }
+    // Dùng stop() thay vì cancel() để đảm bảo lấy được kết quả cuối cùng
+    await _speechToText.stop();
+    _isListening = false;
   }
 
   /// Xử lý text search (không dùng giọng nói)
   static Future<Map<String, dynamic>> processTextSearch(String text) async {
     try {
       print('🔍 Processing text search: $text');
-      
+
       Map<String, dynamic> nlpResult = await _nlpService.processVoiceSearch(
         voiceText: text,
         language: 'vi',
       );
-      
+
       return nlpResult;
     } catch (e) {
       print('❌ Error processing text: $e');
@@ -180,9 +186,9 @@ class NLPVoiceService {
 
   /// Tính độ tương đồng
   static Future<Map<String, dynamic>> calculateSimilarity(
-    String text1,
-    String text2,
-  ) async {
+      String text1,
+      String text2,
+      ) async {
     try {
       return await _nlpService.calculateSimilarity(
         text1: text1,
@@ -196,9 +202,9 @@ class NLPVoiceService {
 
   /// Fuzzy match cho tên phim
   static Future<Map<String, dynamic>> fuzzyMatchMovies(
-    String query,
-    List<String> movieTitles,
-  ) async {
+      String query,
+      List<String> movieTitles,
+      ) async {
     try {
       return await _nlpService.fuzzyMatch(
         query: query,

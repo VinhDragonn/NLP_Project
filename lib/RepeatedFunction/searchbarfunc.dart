@@ -1,13 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:r08fullmovieapp/DetailScreen/checker.dart';
+import 'package:r08fullmovieapp/DetailScreen/voice_search_result.dart';
 import 'package:r08fullmovieapp/RepeatedFunction/repttext.dart';
-import 'package:r08fullmovieapp/services/google_voice_service.dart';
+import 'package:r08fullmovieapp/services/nlp_api_service.dart';
 // import 'package:r08fullmovieapp/apikey/apikey.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:translator/translator.dart';
 
 import 'package:http/http.dart' as http;
 import 'package:fluttertoast/fluttertoast.dart';
-
+import 'dart:async';
 import 'dart:convert';
 
 class searchbarfun extends StatefulWidget {
@@ -20,116 +22,10 @@ class searchbarfun extends StatefulWidget {
 class _searchbarfunState extends State<searchbarfun> {
   ////////////////////////////////search bar function/////////////////////////////////////////////
   List<Map<String, dynamic>> searchresult = [];
-  bool _isListening = false;
-  bool _isVoiceAvailable = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _checkVoiceAvailability();
-  }
-
-  Future<void> _checkVoiceAvailability() async {
-    _isVoiceAvailable = await GoogleVoiceService.initializeSpeech();
-    if (mounted) {
-      setState(() {});
-    }
-  }
-  
-  @override
-  void dispose() {
-    // Clean up resources
-    super.dispose();
-  }
-
-  void _showGoogleAnalysisInfo(String voiceText, Map<String, dynamic> googleAnalysis) {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          backgroundColor: const Color.fromRGBO(25, 25, 25, 1),
-          title: Row(
-            children: [
-              Icon(Icons.mic, color: Colors.green),
-              const SizedBox(width: 8),
-              Text(
-                'Google Voice Search',
-                style: TextStyle(color: Colors.white),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Bạn đã nói:',
-                style: TextStyle(color: Colors.grey, fontSize: 12),
-              ),
-              Text(
-                '"$voiceText"',
-                style: TextStyle(color: Colors.amber, fontSize: 14, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Google hiểu là:',
-                style: TextStyle(color: Colors.grey, fontSize: 12),
-              ),
-              Text(
-                googleAnalysis['search_query'] ?? '',
-                style: TextStyle(color: Colors.green, fontSize: 14, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              if (googleAnalysis['search_type'] != null)
-                Text(
-                  'Loại tìm kiếm: ${_getSearchTypeText(googleAnalysis['search_type'])}',
-                  style: TextStyle(color: Colors.white, fontSize: 12),
-                ),
-              if (googleAnalysis['intent'] != null)
-                Text(
-                  'Ý định: ${_getIntentText(googleAnalysis['intent'])}',
-                  style: TextStyle(color: Colors.white, fontSize: 12),
-                ),
-              if (googleAnalysis['confidence'] != null)
-                Text(
-                  'Độ chính xác: ${(googleAnalysis['confidence'] * 100).toStringAsFixed(1)}%',
-                  style: TextStyle(color: Colors.green, fontSize: 12),
-                ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: Text('Đóng', style: TextStyle(color: Colors.amber)),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  String _getSearchTypeText(String searchType) {
-    Map<String, String> typeMap = {
-      'title': 'Tên phim',
-      'genre': 'Thể loại',
-      'actor': 'Diễn viên',
-      'description': 'Mô tả',
-      'similar': 'Phim tương tự',
-    };
-    return typeMap[searchType] ?? searchType;
-  }
-
-  String _getIntentText(String intent) {
-    Map<String, String> intentMap = {
-      'new_movies': 'Phim mới',
-      'classic_movies': 'Phim kinh điển',
-      'popular': 'Phim phổ biến',
-      'high_rating': 'Phim đánh giá cao',
-      'similar': 'Phim tương tự',
-      'general_search': 'Tìm kiếm chung',
-    };
-    return intentMap[intent] ?? intent;
-  }
+  List<Map<String, dynamic>> hybridResults = [];
+  bool isLoadingHybrid = false;
+  Timer? _debounceTimer;
+  final NLPApiService _nlpApiService = NLPApiService();
 
   Future<void> searchlistfunction(val) async {
     var searchurl =
@@ -168,6 +64,105 @@ class _searchbarfunState extends State<searchbarfun> {
   final TextEditingController searchtext = TextEditingController();
   bool showlist = false;
   var val1;
+  
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    super.dispose();
+  }
+  
+  Future<void> _performHybridSearch(String query) async {
+    if (query.trim().isEmpty) {
+      setState(() {
+        hybridResults.clear();
+        isLoadingHybrid = false;
+      });
+      return;
+    }
+    
+    setState(() {
+      isLoadingHybrid = true;
+      hybridResults.clear();
+    });
+    
+    try {
+      // Translate to English for backend
+      final GoogleTranslator translator = GoogleTranslator();
+      final translation = await translator.translate(query.trim(), to: 'en');
+      final englishQuery = translation.text.trim();
+      
+      // Call hybrid search
+      final response = await _nlpApiService.hybridSearch(
+        query: englishQuery,
+        topK: 12,
+      );
+      
+      final results = (response['results'] as List?) ?? [];
+      final mappedResults = results
+          .map((item) => {
+                'title': (item['movie_title'] ?? '').toString().trim(),
+                'plot': item['plot'] ?? '',
+                'genres': item['genres'] ?? '',
+                'keywords': item['keywords'] ?? '',
+                'score': (item['score'] as num?)?.toDouble() ?? 0.0,
+              })
+          .toList();
+      
+      // Fetch poster data for each result
+      await _attachPostersToHybridResults(mappedResults);
+      
+      if (mounted) {
+        setState(() {
+          hybridResults = mappedResults;
+          isLoadingHybrid = false;
+        });
+      }
+    } catch (e) {
+      print('❌ Hybrid search error: $e');
+      if (mounted) {
+        setState(() {
+          hybridResults.clear();
+          isLoadingHybrid = false;
+        });
+      }
+    }
+  }
+  
+  Future<void> _attachPostersToHybridResults(List<Map<String, dynamic>> results) async {
+    final Map<String, Map<String, dynamic>?> posterCache = {};
+    
+    for (var item in results) {
+      final title = (item['title'] ?? '').toString().trim();
+      if (title.isEmpty) continue;
+      
+      try {
+        final searchUrl = 'https://api.themoviedb.org/3/search/multi?api_key=${dotenv.env['apikey']}&query=${Uri.encodeComponent(title)}';
+        final response = await http.get(Uri.parse(searchUrl));
+        
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          final matches = (data['results'] as List?) ?? [];
+          
+          if (matches.isNotEmpty) {
+            final match = matches[0];
+            final posterPath = match['poster_path'];
+            final posterUrl = posterPath != null 
+                ? 'https://image.tmdb.org/t/p/w500$posterPath'
+                : null;
+            
+            item['posterUrl'] = posterUrl;
+            item['tmdbId'] = match['id'];
+            item['mediaType'] = (match['media_type'] ?? 'movie').toString();
+            item['overview'] = match['overview'];
+            item['voteAverage'] = (match['vote_average'] as num?)?.toDouble() ?? 0.0;
+          }
+        }
+      } catch (e) {
+        print('⚠️ Error fetching poster for $title: $e');
+      }
+    }
+  }
+  
   ////////////////////////////////search bar function/////////////////////////////////////////////
   @override
   Widget build(BuildContext context) {
@@ -190,85 +185,88 @@ class _searchbarfunState extends State<searchbarfun> {
                 child: TextField(
                   autofocus: false,
                   controller: searchtext,
-                  onSubmitted: (value) {
-                    searchresult.clear();
-                    setState(() {
-                      val1 = value;
-                      FocusManager.instance.primaryFocus?.unfocus();
-                    });
+                  onSubmitted: (value) async {
+                    if (value.trim().isEmpty) {
+                      return;
+                    }
+                    
+                    // Clear focus
+                    FocusManager.instance.primaryFocus?.unfocus();
+                    
+                    // Process with NLP and navigate to hybrid search
+                    try {
+                      final nlpResult = await _nlpApiService.processVoiceSearch(
+                        voiceText: value.trim(),
+                        language: 'vi',
+                      );
+                      
+                      // Navigate to hybrid search result page
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => VoiceSearchResultPage(
+                            searchQuery: value.trim(),
+                            useHybrid: true,
+                            aiAnalysis: {
+                              'search_query': nlpResult['processed_query'],
+                              'processed_query': nlpResult['processed_query'] ?? value.trim(),
+                              'original_query': value.trim(),
+                              'intent': nlpResult['intent'],
+                              'confidence': nlpResult['confidence'],
+                              'entities': nlpResult['entities'],
+                              'search_parameters': nlpResult['search_parameters'],
+                              'expanded_queries': nlpResult['expanded_queries'],
+                              'nlp_analysis': nlpResult['analysis'],
+                            },
+                          ),
+                        ),
+                      );
+                    } catch (e) {
+                      // Fallback to old search if NLP fails
+                      print('❌ NLP Error: $e');
+                      searchresult.clear();
+                      setState(() {
+                        val1 = value;
+                        FocusManager.instance.primaryFocus?.unfocus();
+                      });
+                      await searchlistfunction(value);
+                    }
                   },
                   onChanged: (value) {
-                    searchresult.clear();
-
                     setState(() {
                       val1 = value;
+                    });
+                    
+                    // Debounce hybrid search
+                    _debounceTimer?.cancel();
+                    _debounceTimer = Timer(const Duration(milliseconds: 500), () {
+                      _performHybridSearch(value);
                     });
                   },
                   decoration: InputDecoration(
-                      suffixIcon: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Voice search button
-                          if (_isVoiceAvailable)
-                            IconButton(
-                              onPressed: () async {
-                                await GoogleVoiceService.startListening(
-                                  onResult: (String recognizedText, Map<String, dynamic> googleAnalysis) {
-                                    String processedText = googleAnalysis['search_query'] ?? recognizedText;
-                                    setState(() {
-                                      searchtext.text = processedText;
-                                      val1 = processedText;
-                                      searchresult.clear();
-                                    });
-                                    // Trigger search with Google analysis
-                                    searchlistfunction(processedText);
-                                    
-                                    // Show Google analysis info
-                                    _showGoogleAnalysisInfo(recognizedText, googleAnalysis);
-                                  },
-                                  onListeningChanged: () {
-                                    setState(() {
-                                      _isListening = GoogleVoiceService.isListening;
-                                    });
-                                  },
-                                );
-                              },
-                              icon: AnimatedContainer(
-                                duration: const Duration(milliseconds: 200),
-                                child: Icon(
-                                  _isListening ? Icons.mic : Icons.mic_none,
-                                  color: _isListening 
-                                      ? Colors.red 
-                                      : Colors.amber.withOpacity(0.6),
-                                ),
-                              ),
-                            ),
-                          // Clear search button
-                          IconButton(
-                            onPressed: () {
-                              Fluttertoast.showToast(
-                                  webBgColor: "#000000",
-                                  webPosition: "center",
-                                  webShowClose: true,
-                                  msg: "Search Cleared",
-                                  toastLength: Toast.LENGTH_SHORT,
-                                  gravity: ToastGravity.BOTTOM,
-                                  timeInSecForIosWeb: 2,
-                                  backgroundColor: Color.fromRGBO(18, 18, 18, 1),
-                                  textColor: Colors.white,
-                                  fontSize: 16.0);
+                      suffixIcon: IconButton(
+                        onPressed: () {
+                          Fluttertoast.showToast(
+                              webBgColor: "#000000",
+                              webPosition: "center",
+                              webShowClose: true,
+                              msg: "Search Cleared",
+                              toastLength: Toast.LENGTH_SHORT,
+                              gravity: ToastGravity.BOTTOM,
+                              timeInSecForIosWeb: 2,
+                              backgroundColor: Color.fromRGBO(18, 18, 18, 1),
+                              textColor: Colors.white,
+                              fontSize: 16.0);
 
-                              setState(() {
-                                searchtext.clear();
-                                FocusManager.instance.primaryFocus?.unfocus();
-                              });
-                            },
-                            icon: Icon(
-                              Icons.arrow_back_ios_rounded,
-                              color: Colors.amber.withOpacity(0.6),
-                            ),
-                          ),
-                        ],
+                          setState(() {
+                            searchtext.clear();
+                            FocusManager.instance.primaryFocus?.unfocus();
+                          });
+                        },
+                        icon: Icon(
+                          Icons.arrow_back_ios_rounded,
+                          color: Colors.amber.withOpacity(0.6),
+                        ),
                       ),
                       prefixIcon: Icon(
                         Icons.search,
@@ -286,65 +284,49 @@ class _searchbarfunState extends State<searchbarfun> {
                 height: 5,
               ),
 
-              // Voice search status indicator
-              if (_isListening)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.red.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.red.withOpacity(0.3)),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        Icons.mic,
-                        color: Colors.red,
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          "Đang lắng nghe... Hãy nói tên phim bạn muốn tìm",
-                          style: TextStyle(
-                            color: Colors.red,
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
               //if textfield has focus and search result is not empty then display search result
 
               searchtext.text.isNotEmpty
-                  ? FutureBuilder(
-                      future: searchlistfunction(val1),
-                      builder: (context, snapshot) {
-                        if (snapshot.connectionState == ConnectionState.done) {
-                          return SizedBox(
+                  ? isLoadingHybrid
+                      ? Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(20.0),
+                            child: CircularProgressIndicator(
+                              color: Colors.amber,
+                            ),
+                          ),
+                        )
+                      : hybridResults.isEmpty
+                          ? Container()
+                          : SizedBox(
                               height: 400,
                               child: ListView.builder(
-                                  itemCount: searchresult.length,
+                                  itemCount: hybridResults.length,
                                   scrollDirection: Axis.vertical,
                                   physics: BouncingScrollPhysics(),
                                   itemBuilder: (context, index) {
+                                    final item = hybridResults[index];
+                                    final title = (item['title'] ?? '').toString();
+                                    final score = (item['score'] as num?)?.toDouble() ?? 0.0;
+                                    final genres = (item['genres'] ?? '').toString();
+                                    final plot = (item['plot'] ?? '').toString();
+                                    final posterUrl = item['posterUrl'] as String?;
+                                    final tmdbId = item['tmdbId'];
+                                    final mediaType = item['mediaType'] ?? 'movie';
+                                    
                                     return GestureDetector(
-                                        onTap: () {
-                                          Navigator.push(
-                                              context,
-                                              MaterialPageRoute(
-                                                  builder: (context) =>
-                                                      descriptioncheckui(
-                                                        searchresult[index]
-                                                            ['id'],
-                                                        searchresult[index]
-                                                            ['media_type'],
-                                                      )));
-                                        },
+                                        onTap: tmdbId != null
+                                            ? () {
+                                                Navigator.push(
+                                                    context,
+                                                    MaterialPageRoute(
+                                                        builder: (context) =>
+                                                            descriptioncheckui(
+                                                              tmdbId,
+                                                              mediaType,
+                                                            )));
+                                              }
+                                            : null,
                                         child: Container(
                                             margin: EdgeInsets.only(
                                                 top: 4, bottom: 4),
@@ -356,8 +338,12 @@ class _searchbarfunState extends State<searchbarfun> {
                                                 color: Color.fromRGBO(
                                                     20, 20, 20, 1),
                                                 borderRadius: BorderRadius.all(
-                                                    Radius.circular(10))),
+                                                    Radius.circular(10)),
+                                                border: Border.all(
+                                                    color: Colors.green
+                                                        .withOpacity(0.2))),
                                             child: Row(children: [
+                                              // Poster image
                                               Container(
                                                 width: MediaQuery.of(context)
                                                         .size
@@ -365,158 +351,115 @@ class _searchbarfunState extends State<searchbarfun> {
                                                     0.4,
                                                 decoration: BoxDecoration(
                                                     borderRadius:
-                                                        BorderRadius.all(
-                                                            Radius.circular(
-                                                                10)),
-                                                    image: DecorationImage(
-                                                        //color filter
-
-                                                        image: NetworkImage(
-                                                            'https://image.tmdb.org/t/p/w500${searchresult[index]['poster_path']}'),
-                                                        fit: BoxFit.fill)),
+                                                        BorderRadius.only(
+                                                          topLeft: Radius.circular(10),
+                                                          bottomLeft: Radius.circular(10),
+                                                        ),
+                                                    image: posterUrl != null
+                                                        ? DecorationImage(
+                                                            image: NetworkImage(posterUrl),
+                                                            fit: BoxFit.cover,
+                                                          )
+                                                        : null,
+                                                    color: posterUrl == null
+                                                        ? Colors.grey.withOpacity(0.3)
+                                                        : null),
+                                                child: posterUrl == null
+                                                    ? Icon(
+                                                        Icons.movie_outlined,
+                                                        color: Colors.grey,
+                                                        size: 40,
+                                                      )
+                                                    : null,
                                               ),
                                               SizedBox(
-                                                width: 20,
+                                                width: 12,
                                               ),
-                                              Padding(
-                                                  padding:
-                                                      const EdgeInsets.all(8.0),
-                                                  child: Container(
-                                                      child: Column(
-                                                          mainAxisAlignment:
-                                                              MainAxisAlignment
-                                                                  .spaceBetween,
-                                                          children: [
-                                                        ///////////////////////
-                                                        //media type
-                                                        Container(
-                                                          alignment: Alignment
-                                                              .topCenter,
-                                                          child: tittletext(
-                                                            '${searchresult[index]['media_type']}',
-                                                          ),
-                                                        ),
-
-                                                        Container(
-                                                          child: Row(
+                                              Expanded(
+                                                child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.all(8.0),
+                                                    child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment.start,
+                                                        mainAxisAlignment:
+                                                            MainAxisAlignment.spaceBetween,
+                                                        children: [
+                                                          // Title and score
+                                                          Row(
                                                             children: [
-                                                              //vote average box
-                                                              Container(
-                                                                padding:
-                                                                    EdgeInsets
-                                                                        .all(5),
-                                                                height: 30,
-                                                                // width:
-                                                                //     100,
-                                                                decoration: BoxDecoration(
-                                                                    color: Colors
-                                                                        .amber
-                                                                        .withOpacity(
-                                                                            0.2),
-                                                                    borderRadius:
-                                                                        BorderRadius.all(
-                                                                            Radius.circular(6))),
-                                                                child: Center(
-                                                                  child: Row(
-                                                                    mainAxisAlignment:
-                                                                        MainAxisAlignment
-                                                                            .center,
-                                                                    children: [
-                                                                      Icon(
-                                                                        Icons
-                                                                            .star,
-                                                                        color: Colors
-                                                                            .amber,
-                                                                        size:
-                                                                            20,
-                                                                      ),
-                                                                      SizedBox(
-                                                                        width:
-                                                                            5,
-                                                                      ),
-                                                                      ratingtext(
-                                                                          '${searchresult[index]['vote_average']}')
-                                                                    ],
-                                                                  ),
+                                                              Expanded(
+                                                                child: Text(
+                                                                  title.isNotEmpty
+                                                                      ? title
+                                                                      : 'Chưa rõ tên phim',
+                                                                  style: TextStyle(
+                                                                      color: Colors.white,
+                                                                      fontSize: 14,
+                                                                      fontWeight: FontWeight.w600),
+                                                                  maxLines: 2,
+                                                                  overflow: TextOverflow.ellipsis,
                                                                 ),
                                                               ),
-                                                              SizedBox(
-                                                                width: 10,
-                                                              ),
-
-                                                              //popularity
                                                               Container(
-                                                                padding:
-                                                                    EdgeInsets
-                                                                        .all(5),
-                                                                height: 30,
+                                                                padding: EdgeInsets.symmetric(
+                                                                    horizontal: 8, vertical: 4),
                                                                 decoration: BoxDecoration(
-                                                                    color: Colors
-                                                                        .amber
-                                                                        .withOpacity(
-                                                                            0.2),
+                                                                    color: Colors.green
+                                                                        .withOpacity(0.15),
                                                                     borderRadius:
-                                                                        BorderRadius.all(
-                                                                            Radius.circular(8))),
-                                                                child: Center(
-                                                                  child: Row(
-                                                                    mainAxisAlignment:
-                                                                        MainAxisAlignment
-                                                                            .center,
-                                                                    children: [
-                                                                      Icon(
-                                                                        Icons
-                                                                            .people_outline_sharp,
-                                                                        color: Colors
-                                                                            .amber,
-                                                                        size:
-                                                                            20,
-                                                                      ),
-                                                                      SizedBox(
-                                                                        width:
-                                                                            5,
-                                                                      ),
-                                                                      ratingtext(
-                                                                          '${searchresult[index]['popularity']}')
-                                                                    ],
-                                                                  ),
+                                                                        BorderRadius.circular(20)),
+                                                                child: Row(
+                                                                  mainAxisSize: MainAxisSize.min,
+                                                                  children: [
+                                                                    Icon(Icons.bolt,
+                                                                        color: Colors.greenAccent,
+                                                                        size: 14),
+                                                                    SizedBox(width: 4),
+                                                                    Text(
+                                                                      score.toStringAsFixed(2),
+                                                                      style: TextStyle(
+                                                                          color: Colors.greenAccent,
+                                                                          fontSize: 11,
+                                                                          fontWeight: FontWeight.w600),
+                                                                    ),
+                                                                  ],
                                                                 ),
                                                               ),
-
-                                                              //
                                                             ],
                                                           ),
-                                                        ),
-
-                                                        SizedBox(
-                                                            width: MediaQuery.of(
-                                                                        context)
-                                                                    .size
-                                                                    .width *
-                                                                0.4,
-                                                            height: 85,
+                                                          SizedBox(height: 4),
+                                                          // Genres
+                                                          if (genres.isNotEmpty)
+                                                            Text(
+                                                              genres.length > 50
+                                                                  ? '${genres.substring(0, 50)}...'
+                                                                  : genres,
+                                                              style: TextStyle(
+                                                                  color: Colors.amber,
+                                                                  fontSize: 11),
+                                                              maxLines: 1,
+                                                              overflow: TextOverflow.ellipsis,
+                                                            ),
+                                                          SizedBox(height: 4),
+                                                          // Plot
+                                                          Expanded(
                                                             child: Text(
-                                                                textAlign:
-                                                                    TextAlign
-                                                                        .left,
-                                                                ' ${searchresult[index]['overview']}',
-                                                                // 'dsfsafsdffdsfsdf sdfsadfsdf sadfsafd',
-                                                                style: TextStyle(
-                                                                    fontSize:
-                                                                        12,
-                                                                    color: Colors
-                                                                        .white)))
-                                                      ])))
+                                                              plot.trim().isNotEmpty
+                                                                  ? plot
+                                                                  : 'Không có mô tả.',
+                                                              style: TextStyle(
+                                                                  fontSize: 11,
+                                                                  color: Colors.white.withOpacity(0.7)),
+                                                              maxLines: 4,
+                                                              overflow: TextOverflow.ellipsis,
+                                                            ),
+                                                          ),
+                                                        ])),
+                                              ),
                                             ])));
-                                  }));
-                        } else {
-                          return Center(
-                              child: CircularProgressIndicator(
-                            color: Colors.amber,
-                          ));
-                        }
-                      })
-                  : Container(),
+                                  }))
+                          : Container(),
             ],
           )),
     );
